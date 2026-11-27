@@ -5,9 +5,28 @@ Host-бандл для DeepSeek Harness: обязательное делегир
 
 ## Установка
 
-Репозиторий публичный, авторизация не требуется. Установка — одна строка.
+Репозиторий публичный, авторизация не требуется.
 
-**Через агента:** откройте чат DSH и напишите обычным текстом:
+### Способ 1 — tarball из релиза (работает всегда)
+
+Этот способ **не требует git** на машине получателя. Используйте его, если
+установка через `github:` падает с `ERR_PNPM_GIT_RESOLVE_FAILED`.
+
+**Через интерфейс:** **Plugins** → **Add plugin** → вставьте URL:
+
+```
+https://github.com/PaZ00/dsh-free-delegation/releases/download/v1.0.0/local-dsh-free-delegation-1.0.0.tgz
+```
+
+**Через инструмент:**
+
+```
+plugin_manager({ action: "install_bundle", target: "https://github.com/PaZ00/dsh-free-delegation/releases/download/v1.0.0/local-dsh-free-delegation-1.0.0.tgz" })
+```
+
+### Способ 2 — прямо из репозитория (нужен git)
+
+**Через агента:** напишите в чат DSH обычным текстом:
 
 > Установи бандл `github:PaZ00/dsh-free-delegation`
 
@@ -17,25 +36,19 @@ Host-бандл для DeepSeek Harness: обязательное делегир
 github:PaZ00/dsh-free-delegation
 ```
 
-**Через инструмент** (если вызываете `plugin_manager` сами):
+Для воспроизводимой установки закрепите коммит `#<40-символьный-sha>`.
 
-```
-plugin_manager({ action: "install_bundle", target: "github:PaZ00/dsh-free-delegation" })
-```
+> **Требование к способу 2:** `git` в `PATH`. DSH поставляет собственные
+> `node` и `pnpm`, но **не git**. pnpm разрешает `github:`-спеки через
+> `git ls-remote`, поэтому без git установка падает с
+> `ERR_PNPM_GIT_RESOLVE_FAILED`. Отдельной установки pnpm не требуется —
+> используется встроенный.
 
 > `plugin_manager` — инструмент агента внутри DSH, а не команда Windows.
 > В `cmd` или PowerShell его нет. Из консоли установка бандла недоступна:
 > `dsh plugin` только добавляет зависимость через pnpm и не активирует бандл,
 > а профиль `desktop` вообще принадлежит Electron-приложению и управляется
 > только им.
-
-Для воспроизводимой установки закрепите коммит:
-
-```
-github:PaZ00/dsh-free-delegation#<40-символьный-sha>
-```
-
-Без пина кнопка **Update** для этого бандла недоступна.
 
 ### Требования
 
