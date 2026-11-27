@@ -1,0 +1,486 @@
+/**
+ * dsh-free-delegation — Host-половина бандла обязательного делегирования.
+ *
+ * Делает две вещи:
+ *   1. добавляет в system prompt корневого агента мандат делегирования;
+ *   2. ПРИНУЖДАЕТ его технически: `ctx.tools.guard()` запрещает корневому
+ *      облачному агенту рабочие инструменты, пока он не запустил субагента.
+ *
+ * Почему Host-плагин, а не текст в persona пресета: мандат обязан действовать
+ * только у КОРНЕВОГО агента. Ребёнок идёт с delegationDepth = 1 при хостовом
+ * maxDepth = 1, то есть делегировать не может; приказ «каждый ответ обязан
+ * вызвать subagent» заставлял бы ребёнка пытаться и падать на проверке глубины.
+ * Persona пресета — статическая строка и глубину не видит. Секция systemPrompt
+ * с текстом-функцией получает AssembleContext.agent (см. assembleContextFor в
+ * dsh-agent) и решает по факту.
+ *
+ * Почему без импортов из @deepseek-ai/*: плагины, установленные в профиль, не
+ * резолвят bundled-пакеты установки (проверено createRequire: MODULE_NOT_FOUND
+ * на @deepseek-ai/dsh-subagent и @deepseek-ai/dsh-system-prompt). Поэтому глубина
+ * читается прямо из свойств агента — той же формулой, что delegationDepthOf в
+ * dsh-subagent/src/depth.ts, но без импорта.
+ *
+ * @module @local/dsh-free-delegation
+ */
+
+export const name = 'free-delegation'
+
+/** Секции промпта нужен systemPrompt; принуждение требует tools. */
+export const inject = ['systemPrompt', 'tools']
+
+/** Провайдеры, которых мандат не касается: локальные модели делегируют плохо. */
+const DEFAULT_LOCAL_PROVIDERS = ['ollama-local', 'lmstudio-local']
+
+/**
+ * Режимы (пресеты), в которых действует ЖЁСТКОЕ правило единственного
+ * исполнителя: «стандартный» (standard) и «руководитель» (lead).
+ *
+ * Вне этих двух режимов мандат не выдаётся и принуждение не работает:
+ * это прямое требование пользователя. Пресеты cordis и ptc идут без
+ * принуждения (там же снят и `agentOptions` пресета), а minimal его и не мог
+ * получить — в нём не смонтирован инструмент делегирования.
+ *
+ * Если реестр пресетов недоступен или режим не записан, пресет считается
+ * неопознанным и мандат НЕ выдаётся: жёсткое правило действует только там,
+ * где режим достоверно назван одним из перечисленных. Ошибка в эту сторону
+ * лишь снимает принуждение, а не запирает сессию.
+ */
+const DEFAULT_MANDATE_PRESETS = ['standard', 'lead']
+
+/**
+ * ЕДИНСТВЕННЫЙ исполнитель субагентов по требованию пользователя.
+ *
+ * Почему именно эта модель — по живым замерам каталога aiai.by
+ * (GET /v1/models отдаёт sell_pricing и features):
+ *   цена    0.0425283 BYN за 1M входа / 0.170113 за 1M выхода — в 21 раз
+ *           дешевле родителя aiai-by/deepseek-v4.1-flash (0.906232/3.42053);
+ *   bands   ПУСТО — тариф плоский. Обязательное условие: у 47 из 320
+ *           чат-моделей каталога есть ступень (gpt-6-luna ×2/×1.5 после 272K
+ *           токенов), и субагент на больших файлах упирался бы в неё;
+ *   features parallel_tool_calls, prompt_caching, reasoning,
+ *           structured_outputs, tool_calling — без tool_calling субагент
+ *           бесполезен; полный цикл инструмента проверен живым запросом;
+ *   reasoning_mandatory ОТСУТСТВУЕТ (у 82 моделей каталога он есть и ломает
+ *           запуск с унаследованным reasoning-уровнем);
+ *   contextWindow 524288.
+ *
+ * Маршрут объявлен в профиле (llm-pi-ai → aiai-by) с меню
+ * reasoningEfforts low/medium/high, поэтому унаследованный от родителя
+ * уровень low действителен. Уровень off объявлять нельзя: API отвечает на
+ * него HTTP 400 — проверено перебором 27.11.2026.
+ */
+const DEFAULT_EXECUTOR = { provider: 'aiai-by', model: 'solar-mini-4-5' }
+
+/**
+ * ВТОРОЙ исполнитель — на подъём, когда дешёвый не подходит по правилам мандата.
+ *
+ * Зачем две модели. Замеры 27.11.2026 на одинаковых заданиях показали, что
+ * дешёвая модель выигрывает только на коротких задачах:
+ *   короткая (slugify, 1 файл)   дешёвая 0.00141 BYN / 20.9 с / 8 запросов
+ *                                вторая  0.01264 BYN / 67.7 с / 23 запроса
+ *                                -> дешёвая дешевле в 9 раз и втрое быстрее;
+ *   сложная (parseDuration, 8 правил)
+ *                                дешёвая 0.01708 BYN / 180.4 с / 39 запросов
+ *                                вторая  0.01682 BYN / 116.5 с / 22 запроса
+ *                                -> дешёвая ДОРОЖЕ и на 55 % медленнее.
+ * Поэтому правило выбора — по сложности задачи, а не по цене за токен.
+ *
+ * Почему hy4-flash: та же ставка каталога дешевле родителя в ~4.9 раза,
+ * features включают tool_calling, reasoning и vision (у дешёвой зрения нет —
+ * это и есть главный технический повод подъёма), contextWindow 1048576
+ * (у дешёвой 524288).
+ */
+const DEFAULT_ESCALATION = { provider: 'aiai-by', model: 'hy4-flash' }
+
+/** Имя секции: уникально, чтобы не столкнуться с чужими секциями промпта. */
+const SECTION_NAME = 'free-delegation:mandate'
+
+/** Инструмент, наличие которого проверяется перед выдачей мандата. */
+const DEFAULT_TOOL_NAME = 'subagent'
+
+/**
+ * Порядок секции. Ставится сразу после persona (DEPLOYMENT_PERSONA_PREFIX = 0)
+ * и до планирования (PLAN_POLICY = 500), чтобы мандат читался раньше остальных
+ * инструкций и не вытеснялся ими.
+ */
+const SECTION_ORDER = 50
+
+/**
+ * Рабочие инструменты, которые принуждение запрещает корню до первого
+ * делегирования. Список — ЗАПРЕЩАЮЩИЙ, а не разрешающий, и это осознанно:
+ * незнакомый новый инструмент остаётся доступным, поэтому ошибка в списке не
+ * может запереть сессию. Сюда входит только «работа руками»: файлы, оболочка,
+ * поиск в сети, фоновые задачи и выдача результата.
+ */
+const DEFAULT_DENIED_TOOLS = [
+  // Файлы и оболочка.
+  'read', 'read_image', 'write', 'edit', 'apply_patch', 'glob', 'grep',
+  'bash', 'pwsh',
+  // Фоновые задачи: запуск работы в обход делегирования.
+  'job_output', 'job_list', 'job_kill',
+  // Внешние запросы и выдача результата.
+  'web_search', 'web_fetch', 'present',
+  // Инструменты, которые монтируют другие бандлы; в списке на случай,
+  // если такой бандл появится в профиле. Незнакомое имя безвредно:
+  // список запрещающий, и совпадения по нему просто не будет.
+  'str_replace_editor', 'view', 'create', 'insert', 'lsp',
+]
+
+/**
+ * Режим PTC: если виден `run_code`, делегирование идёт ТОЛЬКО изнутри
+ * программы (в пресете ptc инструмент subagent достижим лишь оттуда).
+ * Запрет рабочих инструментов в этом режиме сделал бы делегирование
+ * невозможным, поэтому принуждение там не применяется.
+ */
+const PTC_TRANSPORT_TOOL = 'run_code'
+
+/** Максимальное число слов в description, как того требует схема инструмента. */
+function normalizeList(value, fallback) {
+  if (!Array.isArray(value)) return fallback
+  const items = value.filter(item => typeof item === 'string' && item.trim() !== '')
+  return items.length > 0 ? items : fallback
+}
+
+/**
+ * Нормализовать маршрут единственного исполнителя.
+ *
+ * Мандат обязан назвать provider и model точно: без них корневой агент
+ * подставит что угодно, а ребёнок унаследует дорогой маршрут родителя.
+ * Неполная или испорченная конфигурация откатывается к значению по умолчанию —
+ * лучше предсказуемый исполнитель, чем запуск без маршрута.
+ *
+ * @param {object|undefined} value - поле executor из конфигурации.
+ * @returns {{provider: string, model: string}} маршрут исполнителя.
+ */
+function normalizeExecutor(value) {
+  const provider = typeof value?.provider === 'string' && value.provider.trim() !== ''
+    ? value.provider.trim()
+    : DEFAULT_EXECUTOR.provider
+  const model = typeof value?.model === 'string' && value.model.trim() !== ''
+    ? value.model.trim()
+    : DEFAULT_EXECUTOR.model
+  return { provider, model }
+}
+
+/**
+ * Нормализовать маршрут второго (подъёмного) исполнителя.
+ *
+ * Пустое или испорченное значение откатывается к умолчанию по той же причине,
+ * что и у executor: предсказуемый маршрут лучше запуска без маршрута.
+ * Если escalation объявлен, но совпал с executor, он считается ОТСУТСТВУЮЩИМ:
+ * «два исполнителя», указывающие на одну модель, — это один исполнитель, и
+ * мандат не должен обманывать себя правилом выбора между одинаковыми.
+ *
+ * @param {object|undefined} value - поле escalation из конфигурации.
+ * @param {{provider: string, model: string}} executor - первый исполнитель.
+ * @returns {{provider: string, model: string}|undefined} маршрут либо undefined.
+ */
+function normalizeEscalation(value, executor) {
+  if (value === undefined || value === null) return undefined
+  const provider = typeof value?.provider === 'string' && value.provider.trim() !== ''
+    ? value.provider.trim()
+    : DEFAULT_ESCALATION.provider
+  const model = typeof value?.model === 'string' && value.model.trim() !== ''
+    ? value.model.trim()
+    : DEFAULT_ESCALATION.model
+  if (provider === executor.provider && model === executor.model) return undefined
+  return { provider, model }
+}
+
+/**
+ * Глубина делегирования агента.
+ *
+ * Повторяет формулу delegationDepthOf: заголовок сессии авторитетен и монотонен,
+ * runtime-опция может только углубить счёт. Любая непредвиденная форма данных
+ * даёт 0 — «считать корневым» безопаснее, чем уронить сборку промпта.
+ *
+ * @param {object|undefined} agent - агент из AssembleContext.
+ * @returns {number} неотрицательная целая глубина.
+ */
+function delegationDepthOf(agent) {
+  const header = agent?.session?.header?.delegationDepth
+  const runtime = agent?.options?.subagentDepth
+  const headerDepth = Number.isSafeInteger(header) && header >= 0 ? header : 0
+  const runtimeDepth = Number.isSafeInteger(runtime) && runtime >= 0 ? runtime : 0
+  return Math.max(headerDepth, runtimeDepth)
+}
+
+/**
+ * Активный пресет (режим) агента.
+ *
+ * Читается через сервис `agentPresets` — тот же способ, которым его читают
+ * штатные пакеты DSH (`childSessionMeta`, `tool-schedule`, `dsh-cabinet-mode`):
+ * `ctx.get('agentPresets')?.composedPreset(agent.ctx)`. Импорт типа недоступен
+ * (см. заголовок модуля), поэтому берём по строке через `ctx.get`, а при
+ * отсутствии сервиса возвращаем undefined — «режим не определён».
+ *
+ * @param {object|undefined} agent - агент.
+ * @param {object|undefined} hostCtx - контекст плагина (Host realm).
+ * @returns {string|undefined} id пресета либо undefined.
+ */
+function activePresetOf(agent, hostCtx) {
+  const ctx = agent?.ctx
+  if (ctx === undefined || ctx === null || typeof ctx.get !== 'function') return undefined
+  // Два пути: Host-контекст (прецедент dsh-cabinet-mode) и контекст самого
+  // агента. Сервис живёт на Host-плоскости, но читать его можно обоими.
+  for (const from of [hostCtx, ctx]) {
+    if (from === undefined || from === null || typeof from.get !== 'function') continue
+    try {
+      const presets = from.get('agentPresets')
+      const id = presets?.composedPreset?.(ctx)
+      if (typeof id === 'string' && id !== '') return id
+    } catch {
+      // Пробуем следующий путь: незнакомая форма не должна ломать сборку.
+    }
+  }
+  return undefined
+}
+
+/**
+ * Подпадает ли агент под мандат: корень, не локальный маршрут, инструмент виден,
+ * режим — один из разрешённых.
+ *
+ * @param {object|undefined} agent - агент.
+ * @param {object} settings - нормализованная конфигурация.
+ * @param {object|undefined} tools - сервис ctx.tools.
+ * @param {object|undefined} scope - область видимости сборки.
+ * @param {object|undefined} hostCtx - контекст плагина для чтения режима.
+ * @returns {boolean} true, когда мандат и принуждение применимы.
+ */
+function mandateApplies(agent, settings, tools, scope, hostCtx) {
+  if (agent === undefined || agent === null) return false
+  // Дети делегировать не могут: хостовый maxDepth = 1. Мандат только корню.
+  if (delegationDepthOf(agent) !== 0) return false
+  const provider = agent?.options?.provider
+  if (typeof provider === 'string' && settings.localProviders.includes(provider)) return false
+  // Жёсткое правило — только в режимах «стандартный» и «руководитель».
+  // Неопознанный режим мандата не получает: правило не расширяется молча.
+  const preset = activePresetOf(agent, hostCtx)
+  if (preset === undefined || !settings.mandatePresets.includes(preset)) return false
+  if (tools === undefined) return true
+  // Инструмент обязан существовать: пресет minimal его не монтирует.
+  if (tools.get(settings.toolName, scope) === undefined) return false
+  return true
+}
+
+/**
+ * Текст мандата для одного агента или пустая строка, когда мандат неприменим.
+ *
+ * @param {object} context - AssembleContext сборки промпта.
+ * @param {object} settings - нормализованная конфигурация плагина.
+ * @param {object|undefined} tools - сервис ctx.tools, если доступен.
+ * @returns {string} текст секции либо ''.
+ */
+function mandateText(context, settings, tools, hostCtx) {
+  if (!mandateApplies(context?.agent, settings, tools, context?.scope, hostCtx)) return ''
+  return mandateBody(settings)
+}
+
+/**
+ * Тело мандата: что делать, кого выбирать, чего не делать.
+ *
+ * @param {object} settings - нормализованная конфигурация плагина.
+ * @returns {string} текст секции.
+ */
+function mandateBody(settings) {
+  const executor = `${settings.executor.provider}/${settings.executor.model}`
+  const escalation = settings.escalation === undefined
+    ? undefined
+    : `${settings.escalation.provider}/${settings.escalation.model}`
+  const lines = [
+    '**Обязательное делегирование (мандат распорядителя).**',
+    '',
+    'Ты распорядитель, а не исполнитель. Работа руками тебе технически запрещена: '
+    + 'пока ты не запустил хотя бы одного субагента, рабочие инструменты отвечают отказом.',
+    '',
+    'Порядок работы:',
+    '1. Разбей задачу на независимые части и отправь их субагентам. Независимые задачи запускай одной пачкой в одном сообщении и продолжай полезную работу, пока они идут.',
+  ]
+
+  if (escalation === undefined) {
+    lines.push(
+      `2. Исполнитель у тебя РОВНО ОДИН: \`provider: ${settings.executor.provider}\`, \`model: ${settings.executor.model}\` (${executor}). Указывай эти provider и model явно в КАЖДОМ вызове \`subagent\`. Без них ребёнок наследует маршрут родителя, то есть дорогую модель, — это нарушение мандата.`,
+      '3. Не выбирай других исполнителей и не перебирай маршруты: единственный исполнитель задан конфигурацией профиля, и он же назначен маршрутом по умолчанию для детей. Разные модели на разные задачи не выбираются — все задачи идут на него.',
+    )
+  } else {
+    lines.push(
+      `2. Исполнителей у тебя ДВА, и они не равнозначны. По умолчанию — дешёвая: \`provider: ${settings.executor.provider}\`, \`model: ${settings.executor.model}\` (${executor}). Второй маршрут, \`provider: ${settings.escalation.provider}\`, \`model: ${settings.escalation.model}\` (${escalation}), — только на подъём по правилам пункта 3.`,
+      `3. Как выбирать исполнителя. Указывай provider и model ЯВНО в каждом вызове \`subagent\` — без них ребёнок наследует дорогой маршрут родителя, и это нарушение мандата.`,
+      '   - **Отдавай дешёвой** (`' + executor + '`): чтение файлов, поиск, разведка, сбор фактов, механические правки по образцу, реализацию по короткой однозначной спецификации (одна функция, один файл, правила перечислены явно), тесты по готовому списку случаев, прогоны команд, отчёты по фактам. Всё, что укладывается в 3 шага и 524K контекста.',
+      `   - **Ставь сразу второй** (\`${escalation}\`): сложная логика — несколько взаимодействующих правил, порядок, знаки, краевые случаи, где ошибка не видна глазом (на таких задачах дешёвая не экономит: идёт дольше и делает вдвое больше запросов); нужны изображения (у дешёвой нет зрения); нужен контекст больше 524K; задача изначально нечёткая.`,
+      '   - **Поднимай на второй по ходу дела**, если дешёвая зациклилась (счётчик шагов растёт без прогресса) или провалила задачу дважды подряд. Два провала — сигнал на подъём, а не на третий заход.',
+      '   - Третьих маршрутов нет. Не перебирай модели сверх этих двух и не подменяй их самовольно.',
+    )
+  }
+
+  const tail = [
+    '4. **Не давай субагенту сложную задачу целиком.** Исполнитель слабее тебя: большую задачу он либо бросит, либо сделает поверхностно. Дроби её на несколько мелких шагов и отдавай субагенту ПО ОДНОМУ шагу за вызов, формулируя каждый как проверяемое задание с точным ожидаемым результатом.',
+    '5. **Контролируй каждый шаг.** После каждого субагента сверяй полученный результат с ожидаемым: читай файл, запускай проверку, сравнивай вывод. Следующий шаг ставь только после того, как предыдущий принят по факту. Расхождение — не «продолжай дальше», а переформулированный шаг или отчёт пользователю.',
+    '6. **Приёмку строй на своём корпусе входов, а не на отчёте исполнителя.** Проверенный случай 27.11.2026: дешёвая модель написала `slugify`, где `ъ` и `ь` отображены в пустую строку (задумано выбросить), но из-за falsy-пустой строки в `TRANSLIT[char] || char` они превращались в дефис: `"подъезд"` → `"pod-ezd"`, а не `"podezd"`. Её собственные 7 тестов прошли зелёным — этого случая в них не было. Поэтому: (а) проверяй поведение своим набором входов, включая те, которых нет в тестах исполнителя; (б) смотри, что функция реально вернула, а не что написано в комментариях и таблицах; (в) прогоняй мутационную проверку — подсовывай заведомо испорченную реализацию и убеждайся, что тесты падают. Набор, проходящий на сломанном коде, приёмкой не является.',
+    '7. **За результат отвечает главная модель — ты.** Субагент поставляет сырьё, приёмку и итоговую сборку делаешь ты. Нельзя ссылаться на «субагент сказал»: перед пользователем отвечает твой собственный вывод по проверенным фактам.',
+    '8. Если исполнитель отказал (маршрут недоступен, лимит, ошибка), не подменяй его сам и не делай работу руками: сообщи об отказе пользователю прямо, приведя код и текст ошибки.',
+    '9. Сам делай только то, что делегировать нельзя: постановка задачи, сведение результатов, приёмка и короткий финальный ответ пользователю. Файлы, команды, поиск, сборка и отчёты — работа субагентов.',
+    '10. Результат принимай по факту: команда, её вывод, код возврата. Слово «готово» без вывода результатом не является.',
+  ]
+  return [...lines, ...tail].join('\n')
+}
+
+/**
+ * Установить мандат делегирования и техническое принуждение.
+ *
+ * @param {object} ctx - контекст Cordis.
+ * @param {object} [config] - конфигурация строки бандла.
+ */
+export function apply(ctx, config) {
+  const source = config ?? {}
+  const executor = normalizeExecutor(source.executor)
+  const settings = {
+    enabled: source.enabled !== false,
+    enforce: source.enforce !== false,
+    toolName: typeof source.toolName === 'string' && source.toolName.trim() !== '' ? source.toolName : DEFAULT_TOOL_NAME,
+    localProviders: normalizeList(source.localProviders, DEFAULT_LOCAL_PROVIDERS),
+    mandatePresets: normalizeList(source.mandatePresets, DEFAULT_MANDATE_PRESETS),
+    executor,
+    escalation: normalizeEscalation(source.escalation, executor),
+    deniedTools: normalizeList(source.deniedTools, DEFAULT_DENIED_TOOLS),
+  }
+  if (!settings.enabled) return
+
+  // Читается один раз: реестр инструментов к моменту активации уже смонтирован,
+  // а отсутствие сервиса не должно оставлять профиль без мандата.
+  const tools = ctx.get('tools')
+
+  ctx.systemPrompt.section({
+    name: SECTION_NAME,
+    order: SECTION_ORDER,
+    text: context => mandateText(context, settings, tools, ctx),
+    // Отставка секции: снимается вместе с плагином, инструкция перестаёт действовать.
+    retirement: 'The mandatory subagent-delegation mandate is no longer in effect. Delegate only when it helps.',
+  })
+
+  if (settings.enforce !== true || tools === undefined || typeof tools.guard !== 'function') return
+
+  /**
+   * Состояние принуждения по сессиям: текущий номер хода и номер хода,
+   * в котором делегирование уже состоялось.
+   *
+   * Ключ — id сессии. Значение — `{ turn, creditedTurn }`. Зачёт привязан
+   * к НОМЕРУ ХОДА, а не к факту входящего сообщения: уведомление о завершении
+   * субагента приходит в тот же ход, и сброс по нему перезапер бы инструменты
+   * ровно тогда, когда родитель собирается читать результат.
+   */
+  const state = new Map()
+
+  const sessionIdOf = agent => {
+    const id = agent?.session?.id
+    return typeof id === 'string' && id !== '' ? id : undefined
+  }
+
+  const stateOf = id => {
+    let entry = state.get(id)
+    if (entry === undefined) {
+      entry = { turn: 0, creditedTurn: -1 }
+      state.set(id, entry)
+    }
+    return entry
+  }
+
+  /**
+   * Отметить начало хода. Ход считается новым, если его номер изменился;
+   * тогда зачёт прошлого хода аннулируется.
+   */
+  const observeTurn = (agent, turn) => {
+    const id = sessionIdOf(agent)
+    if (id === undefined || !Number.isSafeInteger(turn)) return
+    const entry = stateOf(id)
+    if (entry.turn !== turn) {
+      entry.turn = turn
+      entry.creditedTurn = -1
+    }
+  }
+
+  /** Зачесть делегирование текущему ходу. */
+  const creditTurn = (agent, turn) => {
+    const id = sessionIdOf(agent)
+    if (id === undefined) return
+    const entry = stateOf(id)
+    if (Number.isSafeInteger(turn)) entry.turn = turn
+    entry.creditedTurn = entry.turn
+  }
+
+  // Начало хода: новое пользовательское сообщение.
+  //
+  // ВАЖНО: здесь НЕЛЬЗЯ слушать `agent/pre-step`. Это waterfall-событие
+  // (см. Event.listEvents: mode 'waterfall'), и слушатель, не вызывающий
+  // `next()`, обрывает подготовку КАЖДОГО шага — проверено на практике:
+  // после добавления такого слушателя субагенты перестали запускаться.
+  // Номера ходов из `agent/inbox/claimed` достаточно.
+  ctx.on('agent/inbox/claimed', payload => observeTurn(payload?.agent, payload?.turn))
+
+  // Зачёт: субагент запущен от имени этой сессии.
+  ctx.on('subagent/start', info => {
+    const parent = info?.parentSessionId
+    if (typeof parent !== 'string' || parent === '') return
+    const entry = stateOf(parent)
+    entry.creditedTurn = entry.turn
+  })
+
+  // Второй путь зачёта — по факту ВЫЗОВА инструмента делегирования, независимо
+  // от исхода. Нужен против самоблокировки: если запуск ребёнка отклонён
+  // (например, маршрут не разрешён или все бесплатные модели в лимите),
+  // `subagent/start` не сработает, и без этого пути корень остался бы без
+  // рабочих инструментов и без возможности делегировать — тупик.
+  // Плата за это — попытка делегирования засчитывается даже при отказе;
+  // это осознанный компромисс в пользу живучести сессии.
+  ctx.on('tools/result', exec => {
+    if (exec?.name !== settings.toolName) return
+    creditTurn(exec?.agent)
+  })
+
+  // Уборка, чтобы карта не росла на длинной сессии.
+  ctx.on('session/disposed', session => {
+    const id = session?.id
+    if (typeof id === 'string') state.delete(id)
+  })
+
+  /**
+   * Запрет рабочего инструмента корню до первого делегирования.
+   *
+   * Монотонный guard: возвращённый отказ нельзя отменить слушателем
+   * (`checkGuards` в dsh-tools идёт после waterfall и не имеет allow-результата).
+   * Функция обязана быть тотальной — при любой неожиданности пропускаем вызов,
+   * а не роняем его: ошибка в принуждении не должна запирать сессию.
+   */
+  tools.guard(exec => {
+    try {
+      if (settings.enforce !== true) return undefined
+      const tool = exec?.name
+      if (typeof tool !== 'string' || !settings.deniedTools.includes(tool)) return undefined
+
+      const agent = exec?.agent
+      // Только корень облачного маршрута в разрешённом режиме; дети,
+      // локальные корни и прочие пресеты не трогаются.
+      if (!mandateApplies(agent, settings, tools, exec?.agent, ctx)) return undefined
+
+      const id = sessionIdOf(agent)
+      if (id === undefined) return undefined
+      const entry = state.get(id)
+      // Зачёт этого хода уже есть — работа руками разрешена.
+      if (entry !== undefined && entry.creditedTurn === entry.turn) return undefined
+
+      // PTC: делегирование возможно только изнутри run_code, запрещать нельзя.
+      if (tools.get(PTC_TRANSPORT_TOOL, agent) !== undefined) return undefined
+
+      return {
+        reason: `Инструмент «${tool}» запрещён мандатом делегирования: этот ход ещё не запустил ни одного субагента. `
+          + `Сначала вызови \`${settings.toolName}\` (provider и model из бесплатных маршрутов, список — \`list_subagent_models\`), `
+          + `затем дождись результата через \`wait_agent\`. Работа руками запрещена; `
+          + `после первого запуска субагента рабочие инструменты снова доступны в этом ходу.`,
+        info: { name: 'DELEGATION_MANDATE', code: 'DELEGATION_MANDATE_REQUIRED' },
+      }
+    } catch {
+      // Fail-open: принуждение не должно ломать сессию из-за собственной ошибки.
+      return undefined
+    }
+  })
+}
