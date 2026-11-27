@@ -104,6 +104,15 @@ console.log('1. Рабочий инструмент запрещён до дел
       assert.equal(denial.info.code, 'DELEGATION_MANDATE_REQUIRED');
     });
   }
+  check('текст отказа не учит опрашивать ожидание', () => {
+    const denial = h.guard(call('read', root));
+    assert.doesNotMatch(denial.reason, /дождись результата через/,
+      'отказ не должен предписывать wait_agent');
+    assert.match(denial.reason, /Не опрашивай ожидание/,
+      'отказ обязан прямо запрещать опрос');
+    assert.match(denial.reason, /workflow/,
+      'отказ обязан называть workflow для веера');
+  });
 }
 
 console.log('');

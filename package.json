@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-free-delegation",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "Mandatory subagent delegation for root cloud agents, with two executor routes: a cheap default and an escalation model.",

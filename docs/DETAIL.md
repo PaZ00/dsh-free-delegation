@@ -1,4 +1,4 @@
-# Mandatory free delegation
+﻿# Mandatory free delegation
 
 Adds a mandatory subagent-delegation mandate to the system prompt of the root
 cloud agent, and keeps child agents on free cloud routes instead of the paid
@@ -32,6 +32,26 @@ subagent: the executor is weaker, so the task must be split into small
 verifiable steps issued one per call, each step checked against its expected
 result, with the root model owning the final result. The mandate is prompt-level
 guidance; the root model answers for the outcome.
+
+## Token economy as law
+
+The mandate is the law of the dispatcher role, not advice. Besides the executor
+routes it carries the token-economy norms taken from the Lead role
+(`~/.dsh/dsh-role-prompts.md`):
+
+- all heavy material — big files, full logs, long dumps, bulky output — is read
+  and assembled by the subagent, which returns a condensed result to the root;
+- the root reads raw material only where a decision cannot be made without it:
+  accepting a contested result, diagnosing a failure, resolving a discrepancy;
+- independent tasks are dispatched in one batch in one message, since waiting in
+  sequence burns the root's context in extra turns;
+- the process is not retold: the user gets the result, the evidence, and what
+  needs their decision.
+
+These norms live in the plugin rather than the preset role text because the role
+is a static preset string, active only where it is enabled, while this mandate is
+issued to the profile's root agent forcibly, together with the technical working
+tool ban.
 
 A child runs at depth `1` while the Host `maxDepth` defaults to `1`, so it
 cannot delegate at all. Sending it an unconditional "every reply must call
@@ -80,8 +100,8 @@ use working tools until it has started at least one subagent.
 
 ## Delivery checks
 
-`test/mandate.test.mjs` (43 checks), `test/enforcement.test.mjs` (33 checks) and
-`test/mutation-check.mjs` (10 mutants, all killed) all pass at the time of writing.
+`test/mandate.test.mjs` (71 checks), `test/enforcement.test.mjs` (34 checks) and
+`test/mutation-check.mjs` (15 mutants, all killed) all pass at the time of writing.
 
 ## Limitations
 

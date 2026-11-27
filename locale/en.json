@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Mandatory free delegation",
-    "description": "Requires the root cloud agent to delegate work to subagents running on free cloud routes, and keeps child agents on free models instead of the paid parent route.",
+    "description": "Requires the root cloud agent to delegate work to subagents running on free cloud routes, keeps child agents on free models instead of the paid parent route, and fixes the token-economy law of the expensive root model.",
     "detail": "docs/DETAIL.md"
   }
 }
