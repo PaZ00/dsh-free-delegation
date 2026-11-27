@@ -28,7 +28,9 @@
     "docs",
     "icon.svg",
     "README.md",
-    "test"
+    "test/mandate.test.mjs",
+    "test/enforcement.test.mjs",
+    "test/mutation-check.mjs"
   ],
   "scripts": {
     "test": "node test/mandate.test.mjs && node test/enforcement.test.mjs && node test/mutation-check.mjs"
